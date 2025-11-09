@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pillow
+rembg==2.0.67
+onnxruntime
+numpy
+opencv-python-headless
+python-multipart
