@@ -6,3 +6,4 @@ onnxruntime
 numpy
 opencv-python-headless
 python-multipart
+pymatting>=1.1.12
