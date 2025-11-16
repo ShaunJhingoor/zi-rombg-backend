@@ -1,228 +1,228 @@
-import os, shutil, subprocess, tempfile
+# app.py — FastAPI + Robust Video Matting (RVM, resnet50), minimal processing
+
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Deque, Optional, Tuple, List
-from collections import deque
 
 import numpy as np
-import cv2
 from PIL import Image
+import torch
+import cv2
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
-from rembg import remove, new_session
 
-# =============================================================
-# CONFIG
-# =============================================================
-DEFAULT_FPS = 20
-EDGE_SHRINK_PX = 10
-EDGE_BAND_PX = 4
-INPAINT_RADIUS = 5
-CHROMA_GREEN = (16, 255, 16)
+# ===================== CONFIG =====================
+DEFAULT_FPS = 20          # for extraction / re-encode
+DOWNSAMPLE_RATIO = 0.10   # lower = better quality, slower
+WARMUP_STEPS     = 6      # extra passes on first frame to stabilize
 
-app = FastAPI(title="AI Video BG Remover – Stable Tight Matte")
+# No aggressive cleanup anymore:
+CLAMP_BELOW = 0           # 0 = do NOT kill weak alpha
+SHRINK_PX   = 0           # 0 = do NOT erode matte
+BLUR_SIGMA  = 0.0         # 0 = no blur; raw edges from model
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000", "http://127.0.0.1:3000",
-        "http://localhost:5173", "http://127.0.0.1:5173"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# =============================================================
-# UTILITIES
-# =============================================================
-def which(cmd: str) -> bool:
-    from shutil import which as _which
-    return _which(cmd) is not None
+# ===================== SIMPLE FFMPEG WRAPPERS =====================
 
-def ffmpeg(args: List[str]):
+def ffmpeg_run(args):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + args
     print("▶", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
-def safe_extract_rgba(in_path: Path, frames_dir: Path, fps: int = DEFAULT_FPS):
-    ffmpeg([
+
+def extract_frames(in_path: Path, frames_dir: Path, fps: int = DEFAULT_FPS):
+    """
+    Extract RGBA PNG frames from input video using ffmpeg.
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg_run([
         "-i", str(in_path),
         "-vf", f"fps={fps},format=rgba",
         "-pix_fmt", "rgba",
         str(frames_dir / "frame_%05d.png"),
     ])
 
-def mask_from(img: Image.Image, session):
-    m = remove(img, session=session, only_mask=True,
-               alpha_matting=True,
-               alpha_matting_foreground_threshold=240,
-               alpha_matting_background_threshold=10,
-               alpha_matting_erode_size=6)
-    return np.array(m, dtype=np.uint8)
 
-# =============================================================
-# PYMATTING COMPATIBILITY SHIM
-# =============================================================
-import inspect
-HAS_PYMATTING = False
+def encode_rgba_to_mov(frames_dir: Path, out_path: Path, fps: int = DEFAULT_FPS):
+    """
+    Encode RGBA PNG frames into a .mov with alpha (ProRes 4444).
+    """
+    ffmpeg_run([
+        "-framerate", str(fps),
+        "-i", str(frames_dir / "frame_%05d.png"),
+        "-c:v", "prores_ks",
+        "-profile:v", "4444",
+        "-pix_fmt", "yuva444p10le",
+        str(out_path),
+    ])
+
+
+# ===================== LOAD RVM MODEL (RESNET50) =====================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("➡ Using device:", device)
+
 try:
-    from pymatting import estimate_alpha_cf as _estimate_alpha_cf
-    HAS_PYMATTING = True
+    print("🔄 Loading RVM (resnet50)...")
+    rvm_model = torch.hub.load(
+        "PeterL1n/RobustVideoMatting",
+        "resnet50",        # higher quality than mobilenetv3
+        trust_repo=True,
+    ).to(device).eval()
+    print("✅ RVM loaded.")
+except Exception as e:
+    print("❌ Failed to load RVM:", e)
+    rvm_model = None
 
-    def estimate_alpha_cf_compat(I, T, reg=1e-5, wr=1):
-        """
-        Compatibility wrapper for all PyMatting API variants.
-        """
-        sig = inspect.signature(_estimate_alpha_cf)
-        params = sig.parameters
 
-        # new API
-        if "regularization" in params or "window_radius" in params:
-            try:
-                return _estimate_alpha_cf(I, T,
-                                          regularization=reg,
-                                          window_radius=wr)
-            except TypeError:
-                pass
+def ensure_rvm_ready():
+    if rvm_model is None:
+        raise HTTPException(status_code=500, detail="RVM model failed to load on server startup")
 
-        # mid API
-        if "lambda_" in params or "lmbda" in params:
-            try:
-                kw = {}
-                if "lambda_" in params: kw["lambda_"] = reg
-                if "lmbda" in params: kw["lmbda"] = reg
-                if "window_radius" in params: kw["window_radius"] = wr
-                return _estimate_alpha_cf(I, T, **kw)
-            except TypeError:
-                pass
 
-        # legacy API (preconditioner/laplacian_kwargs)
-        if "laplacian_kwargs" in params:
-            lap_kwargs = {"radius": wr, "epsilon": 1e-7}
-            try:
-                return _estimate_alpha_cf(I, T,
-                                          preconditioner=None,
-                                          laplacian_kwargs=lap_kwargs,
-                                          cg_kwargs=None)
-            except TypeError:
-                pass
+# ===================== RVM FRAME PIPELINE (NO FANCY CLEANUP) =====================
 
-        # oldest fallback
-        try:
-            return _estimate_alpha_cf(I, T, reg, wr)
-        except Exception:
-            return _estimate_alpha_cf(I, T)
-except Exception:
-    def estimate_alpha_cf_compat(I, T, reg=1e-5, wr=1):
-        return None
-
-# =============================================================
-# REFINEMENT FUNCTIONS
-# =============================================================
-def inward_offset_mask(alpha_u8: np.ndarray, px: int) -> np.ndarray:
-    fg = (alpha_u8 > 0).astype(np.uint8)
-    if fg.max() == 0: return alpha_u8
-    dist = cv2.distanceTransform(fg, cv2.DIST_L2, 3)
-    return (dist > float(px)).astype(np.uint8) * 255
-
-def edge_band(alpha_u8: np.ndarray, inner_px: int, band_px: int) -> np.ndarray:
-    fg = (alpha_u8 > 0).astype(np.uint8)
-    if fg.max() == 0: return np.zeros_like(alpha_u8, np.uint8)
-    dist = cv2.distanceTransform(fg, cv2.DIST_L2, 3)
-    return ((dist > float(inner_px)) & (dist <= float(inner_px + band_px))).astype(np.uint8) * 255
-
-def edge_inpaint_inward(rgb_u8: np.ndarray, ring_mask_u8: np.ndarray, radius: int) -> np.ndarray:
-    if ring_mask_u8.max() == 0: return rgb_u8
-    return cv2.inpaint(rgb_u8, ring_mask_u8, radius, cv2.INPAINT_TELEA)
-
-def closed_form_refine(rgb_u8: np.ndarray, alpha_u8: np.ndarray,
-                       inner_px: int, band_px: int) -> np.ndarray:
+def run_rvm_on_frames(
+    frames_dir: Path,
+    out_dir: Path,
+    downsample_ratio: float = DOWNSAMPLE_RATIO,
+    clamp_below: int = CLAMP_BELOW,
+    shrink_px: int = SHRINK_PX,
+    blur_sigma: float = BLUR_SIGMA,
+    warmup_steps: int = WARMUP_STEPS,
+):
     """
-    Closed-form matting refinement with compatibility across PyMatting versions.
+    Run RVM on frames with minimal modifications:
+      - warmup on first frame (stabilize recurrence)
+      - optional *gentle* alpha tweaks (currently all disabled)
     """
-    if not HAS_PYMATTING:
-        return alpha_u8
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frame_paths = sorted(frames_dir.glob("frame_*.png"))
 
-    h, w = alpha_u8.shape
-    trimap = np.zeros_like(alpha_u8, dtype=np.uint8)
-    trimap[alpha_u8 >= 240] = 255
-    trimap[(alpha_u8 > 0) & (alpha_u8 < 240)] = 128
+    if not frame_paths:
+        raise RuntimeError("No frames extracted")
 
-    # early exit if no ambiguous pixels
-    if (trimap == 128).sum() < 20:
-        return alpha_u8
+    rec = [None, None, None, None]
 
-    I = rgb_u8.astype(np.float64) / 255.0
-    T = trimap.astype(np.float64) / 255.0
+    with torch.no_grad():
+        for idx, fpath in enumerate(frame_paths):
+            img = Image.open(fpath).convert("RGB")
+            rgb = np.array(img).astype(np.float32) / 255.0
 
-    try:
-        alpha_ref = estimate_alpha_cf_compat(I, T, reg=1e-5, wr=1)
-        if alpha_ref is None:
-            return alpha_u8
-        return np.clip(alpha_ref * 255.0, 0, 255).astype(np.uint8)
-    except Exception as e:
-        print("Closed-form refine failed:", e)
-        return alpha_u8
+            # RVM input tensor
+            src = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device)
 
-# =============================================================
-# MAIN ROUTE
-# =============================================================
-SESSION_HUMAN = new_session("u2net_human_seg")
+            # warmup on first frame
+            if idx == 0:
+                for _ in range(warmup_steps):
+                    fgr, pha, *rec = rvm_model(src, *rec, downsample_ratio=downsample_ratio)
+            else:
+                fgr, pha, *rec = rvm_model(src, *rec, downsample_ratio=downsample_ratio)
+
+            # back to numpy
+            fgr_np = (fgr[0].permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            alpha = (pha[0, 0].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+
+            # ---------- MINIMAL ALPHA TWEAKS (ALL VERY GENTLE / OFF) ----------
+
+            # 1) optional noise clamp
+            if clamp_below > 0:
+                alpha[alpha < clamp_below] = 0
+
+            # 2) optional tiny shrink
+            if shrink_px > 0:
+                fg = (alpha > 0).astype(np.uint8)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                fg_shrunk = cv2.erode(fg, kernel, iterations=shrink_px)
+                alpha[(fg == 1) & (fg_shrunk == 0)] = 0
+
+            # 3) optional smoothing
+            if blur_sigma > 0:
+                alpha = cv2.GaussianBlur(alpha, (0, 0), blur_sigma)
+
+            # Compose RGBA with *raw* alpha
+            rgba = np.dstack([fgr_np, alpha])
+            Image.fromarray(rgba, "RGBA").save(out_dir / fpath.name)
+
+
+# ===================== FASTAPI APP =====================
+
+app = FastAPI(title="AI Video BG Remover – RVM (minimal)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],    # tighten for production if needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok" if rvm_model else "error",
+        "device": device,
+    }
+
+
+# ===================== /process ENDPOINT =====================
 
 @app.post("/process")
 async def process(video: UploadFile = File(...)):
-    if not which("ffmpeg"):
-        raise HTTPException(500, "ffmpeg not found")
+    ensure_rvm_ready()
+
+    if not video.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    print("📥 Uploaded:", video.filename)
 
     with tempfile.TemporaryDirectory() as tdir_str:
         tdir = Path(tdir_str)
-        in_path = tdir / video.filename
+        input_path = tdir / video.filename
         frames_dir = tdir / "frames"
-        out_dir = tdir / "nobg"
-        frames_dir.mkdir(); out_dir.mkdir()
+        out_frames_dir = tdir / "nobg"
+        out_video = tdir / f"{input_path.stem}_nobg.mov"
 
-        with open(in_path, "wb") as f:
+        # Save upload
+        with open(input_path, "wb") as f:
             shutil.copyfileobj(video.file, f)
 
-        safe_extract_rgba(in_path, frames_dir, DEFAULT_FPS)
-        frame_paths = sorted(frames_dir.glob("frame_*.png"))
-        if not frame_paths:
-            raise RuntimeError("no frames extracted")
+        print("➡ Saved to:", input_path)
 
-        prev_rgb = None
-        for fpath in frame_paths:
-            img = Image.open(fpath).convert("RGBA")
-            np_rgba = np.array(img)
-            rgb = np_rgba[:, :, :3].astype(np.uint8)
-            mask = mask_from(img, SESSION_HUMAN)
+        # 1) Extract frames
+        print("🎞 Extracting frames...")
+        extract_frames(input_path, frames_dir, fps=DEFAULT_FPS)
 
-            # shrink + refine
-            mask_in = inward_offset_mask(mask, EDGE_SHRINK_PX)
-            ring = edge_band(mask_in, EDGE_SHRINK_PX, EDGE_BAND_PX)
-            rgb_fixed = edge_inpaint_inward(rgb, ring, INPAINT_RADIUS)
+        # 2) Run RVM with minimal tweaks
+        print("🧠 Running RVM (minimal cleanup)...")
+        run_rvm_on_frames(
+            frames_dir,
+            out_frames_dir,
+            downsample_ratio=DOWNSAMPLE_RATIO,
+            clamp_below=CLAMP_BELOW,
+            shrink_px=SHRINK_PX,
+            blur_sigma=BLUR_SIGMA,
+            warmup_steps=WARMUP_STEPS,
+        )
 
-            # refine matte edges
-            refined = closed_form_refine(rgb_fixed, mask_in, EDGE_SHRINK_PX, EDGE_BAND_PX)
+        # 3) Encode to MOV with alpha
+        print("🎬 Encoding output video...")
+        encode_rgba_to_mov(out_frames_dir, out_video, fps=DEFAULT_FPS)
 
-            out_rgba = np.dstack([rgb_fixed, refined])
-            Image.fromarray(out_rgba, "RGBA").save(out_dir / fpath.name)
-            prev_rgb = rgb.copy()
+        print("✅ DONE:", out_video)
 
-        out_mov = tdir / f"{in_path.stem}_nobg.mov"
-        ffmpeg([
-            "-framerate", str(DEFAULT_FPS),
-            "-i", str(out_dir / "frame_%05d.png"),
-            "-c:v", "prores_ks", "-profile:v", "4444",
-            "-pix_fmt", "yuva444p10le",
-            str(out_mov),
-        ])
+        # 4) Return file
+        final_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mov")
+        final_tmp.close()
+        shutil.copyfile(out_video, final_tmp.name)
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mov"); tmp.close()
-        shutil.copyfile(out_mov, tmp.name)
         return FileResponse(
-            path=tmp.name, media_type="video/quicktime",
-            filename=Path(tmp.name).name,
-            background=BackgroundTask(lambda p: os.path.exists(p) and os.remove(p), tmp.name)
+            path=final_tmp.name,
+            media_type="video/quicktime",
+            filename="bg_removed.mov",
+            headers={"Cache-Control": "no-store"},
         )
