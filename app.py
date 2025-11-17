@@ -71,7 +71,7 @@ try:
     print("🔄 Loading RVM (resnet50) from local /rvm ...")
     rvm_model = torch.hub.load(
         "/rvm",          # local path you cloned to in Docker
-        "resnet50",
+        "mobilenetv3",
         source="local",  
         trust_repo=True,
     ).to(device).eval()
