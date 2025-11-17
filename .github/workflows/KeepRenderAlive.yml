@@ -1,0 +1,37 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:          # allows manual run
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Render Health Endpoint
+        run: |
+          echo "========================================"
+          echo "🔥 Keep-Alive Ping (Render Backend)"
+          echo "⏱️  Timestamp: $(date)"
+          echo "========================================"
+
+          # Do the request (captures both body + status)
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" https://zi-rombg-backend.onrender.com/health)
+
+          echo "$RESPONSE"
+          echo "----------------------------------------"
+
+          # Extract status code
+          STATUS=$(echo "$RESPONSE" | grep HTTP_STATUS | cut -d':' -f2)
+
+          # Log status in a friendly way
+          if [ "$STATUS" -eq 200 ]; then
+            echo "✅  Render responded successfully (200 OK)"
+          else
+            echo "❌  Render returned an error (HTTP $STATUS)"
+            echo "This does NOT fail the workflow, since it's only a keep-alive."
+          fi
+
+          echo "========================================"
