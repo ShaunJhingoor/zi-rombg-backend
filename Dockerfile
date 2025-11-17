@@ -19,6 +19,6 @@ COPY app.py .
 ENV PORT=8080
 EXPOSE 8080
 
-# 👇 change this line
+
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers 1"]
 

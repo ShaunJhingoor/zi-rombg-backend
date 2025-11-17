@@ -62,19 +62,24 @@ def encode_rgba_to_mov(frames_dir: Path, out_path: Path, fps: int = DEFAULT_FPS)
 
 # ===================== LOAD RVM MODEL (RESNET50) =====================
 
+
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("➡ Using device:", device)
 
 try:
-    print("🔄 Loading RVM (resnet50)...")
+    print("🔄 Loading RVM (resnet50) from local /rvm ...")
     rvm_model = torch.hub.load(
-        "/rvm",
-        "resnet50",        # higher quality than mobilenetv3
+        "/rvm",          # local path you cloned to in Docker
+        "resnet50",
+        source="local",  
         trust_repo=True,
     ).to(device).eval()
-    print("✅ RVM loaded.")
+    print("✅ RVM loaded from local.")
 except Exception as e:
-    print("❌ Failed to load RVM:", e)
+    import traceback
+    print("❌ Failed to load RVM locally:", repr(e))
+    traceback.print_exc()
     rvm_model = None
 
 
