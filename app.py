@@ -68,7 +68,7 @@ print("➡ Using device:", device)
 try:
     print("🔄 Loading RVM (resnet50)...")
     rvm_model = torch.hub.load(
-        "PeterL1n/RobustVideoMatting",
+        "/rvm",
         "resnet50",        # higher quality than mobilenetv3
         trust_repo=True,
     ).to(device).eval()

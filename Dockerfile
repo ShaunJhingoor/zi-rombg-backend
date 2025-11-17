@@ -7,6 +7,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
+RUN git clone https://github.com/PeterL1n/RobustVideoMatting.git /rvm
 # Install deps first to leverage Docker layer cache
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
