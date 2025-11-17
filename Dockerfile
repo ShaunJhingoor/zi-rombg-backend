@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-# FFmpeg (Debian build includes zscale & prores_ks)
+# Install system deps: ffmpeg + git
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
+ && apt-get install -y --no-install-recommends ffmpeg git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,4 +20,5 @@ ENV PORT=8080
 EXPOSE 8080
 
 # 👇 change this line
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT} --workers 1"]
+
