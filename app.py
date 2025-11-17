@@ -159,7 +159,7 @@ app = FastAPI(title="AI Video BG Remover – RVM (minimal)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ai-rembg.vercel.app"],    # tighten for production if needed
+    allow_origins=["*"],    # tighten for production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
