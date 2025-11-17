@@ -154,7 +154,7 @@ app = FastAPI(title="AI Video BG Remover – RVM (minimal)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # tighten for production if needed
+    allow_origins=["https://ai-rembg.vercel.app/"],    # tighten for production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -170,6 +170,13 @@ def health():
 
 
 # ===================== /process ENDPOINT =====================
+@app.get("/health")
+def health():
+    return {
+        "rvm_status": "ok" if rvm_model else "error",
+        "device": device,
+    }
+
 
 @app.post("/process")
 async def process(video: UploadFile = File(...)):
